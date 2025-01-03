@@ -30,13 +30,53 @@ const client = new Client({
 });
 
 // Rate limiting configuration
-const MESSAGE_QUEUE = new Map();
-const RATE_LIMIT = {
-    messages: 10,
-    timeWindow: 60000,
-    cooldown: 5000
+const USER_RATE_LIMIT = {
+    messages: parseInt(process.env.USER_MESSAGES_PER_MINUTE) || 4,
+    timeWindow: 60000, // 1 minute in milliseconds
+    cooldown: parseInt(process.env.USER_COOLDOWN_MS) || 5000
 };
+
+// Rate limiting storage
+const USER_MESSAGE_QUEUE = new Map();
 const PROCESSING = new Set();
+
+function isUserRateLimited(userId) {
+    const now = Date.now();
+    const queue = USER_MESSAGE_QUEUE.get(userId) || { messages: [], lastProcess: 0 };
+    
+    // Clean up old messages
+    queue.messages = queue.messages.filter(time => now - time < USER_RATE_LIMIT.timeWindow);
+    
+    // Check rate limits
+    if (queue.messages.length >= USER_RATE_LIMIT.messages) {
+        const oldestMessage = queue.messages[0];
+        const timeUntilNextAllowed = (USER_RATE_LIMIT.timeWindow - (now - oldestMessage));
+        return {
+            limited: true,
+            timeUntilNext: Math.ceil(timeUntilNextAllowed / 1000)
+        };
+    }
+    
+    if (now - queue.lastProcess < USER_RATE_LIMIT.cooldown) {
+        return {
+            limited: true,
+            timeUntilNext: Math.ceil((USER_RATE_LIMIT.cooldown - (now - queue.lastProcess)) / 1000)
+        };
+    }
+    
+    return { limited: false };
+}
+
+// Clean up user message queues periodically
+setInterval(() => {
+    const now = Date.now();
+    for (const [userId, queue] of USER_MESSAGE_QUEUE.entries()) {
+        queue.messages = queue.messages.filter(time => now - time < USER_RATE_LIMIT.timeWindow);
+        if (queue.messages.length === 0) {
+            USER_MESSAGE_QUEUE.delete(userId);
+        }
+    }
+}, 60000);
 
 // Commands collection
 client.commands = new Collection();
@@ -69,6 +109,13 @@ const baseCommands = [
         .addNumberOption(option =>
             option.setName('value')
                 .setDescription('The value to set')
+                .setRequired(true)),
+    new SlashCommandBuilder()
+        .setName('set-system-prompt')
+        .setDescription('Set the system prompt for the AI')
+        .addStringOption(option =>
+            option.setName('prompt')
+                .setDescription('The system prompt to use')
                 .setRequired(true)),
     new SlashCommandBuilder()
         .setName('reset-settings')
@@ -147,23 +194,6 @@ async function registerCommands() {
     } catch (error) {
         console.error('Error registering commands:', error);
     }
-}
-
-function isRateLimited(channelId) {
-    const now = Date.now();
-    const queue = MESSAGE_QUEUE.get(channelId) || { messages: [], lastProcess: 0 };
-    
-    queue.messages = queue.messages.filter(time => now - time < RATE_LIMIT.timeWindow);
-    
-    if (queue.messages.length >= RATE_LIMIT.messages) {
-        return true;
-    }
-    
-    if (now - queue.lastProcess < RATE_LIMIT.cooldown) {
-        return true;
-    }
-    
-    return false;
 }
 
 function updateConversationHistory(channelId, userMessage, botResponse, userId = null) {
@@ -283,7 +313,8 @@ function getDefaultSettings() {
         model: process.env.LLM_MODEL,
         temperature: API_CONFIG.temperature,
         max_tokens: API_CONFIG.max_tokens,
-        memory: MAX_MESSAGES
+        memory: MAX_MESSAGES,
+        systemPrompt: process.env.SYSTEM_PROMPT
     };
 }
 
@@ -307,7 +338,8 @@ function formatSettings(settings) {
            `🤖 Model: \`${settings.model}\`\n` +
            `🌡️ Temperature: \`${settings.temperature}\`\n` +
            `📝 Max Tokens: \`${settings.max_tokens}\`\n` +
-           `💭 Memory: \`${settings.memory || MAX_MESSAGES}\` messages\n`;
+           `💭 Memory: \`${settings.memory || MAX_MESSAGES}\` messages\n` +
+           `💬 System Prompt: \`${settings.systemPrompt || process.env.SYSTEM_PROMPT}\`\n`;
 }
 
 // Function to format help message
@@ -318,6 +350,7 @@ function getHelpMessage() {
            `⚙️ \`/settings\` - Show current model and parameters\n` +
            `🤖 \`/set-model <model>\` - Change the AI model\n` +
            `🎚️ \`/set-parameter <parameter> <value>\` - Set temperature or max_tokens\n` +
+           `💭 \`/set-system-prompt <prompt>\` - Set the system prompt for the AI\n` +
            `💭 \`/set-memory <1-10>\` - Set how many messages to remember\n` +
            `🔄 \`/reset-settings\` - Reset all settings to default values\n` +
            `❓ \`/help\` - Show this help message\n\n` +
@@ -384,6 +417,17 @@ client.on(Events.InteractionCreate, async interaction => {
                 settings2[param] = value;
                 saveUserSettings();
                 await interaction.reply({ content: `✅ ${param} set to: \`${value}\``, ephemeral: true });
+                break;
+
+            case 'set-system-prompt':
+                const newPrompt = interaction.options.getString('prompt');
+                const promptSettings = getUserSettings(interaction.user.id);
+                promptSettings.systemPrompt = newPrompt;
+                saveUserSettings();
+                await interaction.reply({ 
+                    content: `✅ System prompt set to: \`${newPrompt}\``, 
+                    ephemeral: true 
+                });
                 break;
 
             case 'reset-settings':
@@ -565,8 +609,7 @@ function formatModelsTable(models) {
     for (const model of sortedModels) {
         const modelName = model.id;
         const tier = model.tier ? `(${model.tier})` : '';
-        const contextLength = model.context_length ? ` - ${model.context_length} tokens` : '';
-        output += `🤖 \`${modelName}\` ${tier}${contextLength}\n`;
+        output += `🤖 \`${modelName}\` ${tier}\n`;
     }
 
     return output;
@@ -594,7 +637,7 @@ client.once(Events.ClientReady, async client => {
     await registerCommands();
 });
 
-// Modify the existing message handler to remove the [models] check since we now have a slash command
+// Update the message handler to use user rate limiting
 client.on(Events.MessageCreate, async interaction => {
     if (!interaction.mentions.has(client.user.id) || 
         interaction.author.bot || 
@@ -608,24 +651,26 @@ client.on(Events.MessageCreate, async interaction => {
 
     if (!content) return;
 
-    if (PROCESSING.has(channelId)) {
-        await interaction.reply("Please wait! I'm still processing the previous request 😅");
+    if (PROCESSING.has(userId)) {
+        await interaction.reply("Please wait! I'm still processing your previous request 😅");
         return;
     }
 
-    if (isRateLimited(channelId)) {
-        await interaction.reply("Please slow down! Try again in a few seconds.");
+    const rateLimitStatus = isUserRateLimited(userId);
+    if (rateLimitStatus.limited) {
+        await interaction.reply(`Please slow down! Try again in ${rateLimitStatus.timeUntilNext} seconds.`);
         return;
     }
 
     try {
-        PROCESSING.add(channelId);
+        PROCESSING.add(userId);
         await interaction.channel.sendTyping();
 
-        const queue = MESSAGE_QUEUE.get(channelId) || { messages: [], lastProcess: 0 };
+        // Update user's message queue
+        const queue = USER_MESSAGE_QUEUE.get(userId) || { messages: [], lastProcess: 0 };
         queue.messages.push(Date.now());
         queue.lastProcess = Date.now();
-        MESSAGE_QUEUE.set(channelId, queue);
+        USER_MESSAGE_QUEUE.set(userId, queue);
 
         // Parse parameters from the message
         const { content: cleanContent, params } = parseParameters(content);
@@ -648,20 +693,9 @@ client.on(Events.MessageCreate, async interaction => {
         console.error('Error processing message:', error);
         await interaction.reply('Sorry, an error occurred while processing your message.');
     } finally {
-        PROCESSING.delete(channelId);
+        PROCESSING.delete(userId);
     }
 });
-
-// Clean up message queues periodically
-setInterval(() => {
-    const now = Date.now();
-    for (const [channelId, queue] of MESSAGE_QUEUE.entries()) {
-        queue.messages = queue.messages.filter(time => now - time < RATE_LIMIT.timeWindow);
-        if (queue.messages.length === 0) {
-            MESSAGE_QUEUE.delete(channelId);
-        }
-    }
-}, 60000);
 
 // Error handling
 client.on(Events.Error, error => {
