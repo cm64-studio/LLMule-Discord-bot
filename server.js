@@ -507,12 +507,6 @@ async function getAPIResponse(channelId, prompt, retryCount = 0, customParams = 
 
         // Detailed response logging
         console.log('Full API Response:', JSON.stringify(response.data, null, 2));
-        console.log('API Response structure:', {
-            status: response.status,
-            hasData: !!response.data,
-            dataKeys: Object.keys(response.data || {}),
-            hasChoices: response.data?.choices?.length > 0
-        });
 
         // Check if response has a different structure
         let botResponse;
@@ -521,13 +515,10 @@ async function getAPIResponse(channelId, prompt, retryCount = 0, customParams = 
         if (response.data?.choices?.[0]?.message?.content) {
             botResponse = response.data.choices[0].message.content;
         } else if (response.data?.response) {
-            // Some APIs might return the response directly
             botResponse = response.data.response;
         } else if (response.data?.message) {
-            // Or might have it under 'message'
             botResponse = response.data.message;
         } else if (typeof response.data === 'string') {
-            // Or might return the string directly
             botResponse = response.data;
         } else {
             console.error('Unexpected API response structure:', response.data);
@@ -535,9 +526,22 @@ async function getAPIResponse(channelId, prompt, retryCount = 0, customParams = 
         }
 
         if (botResponse) {
-            // Add parameter legend to response
-            botResponse += formatParameterLegend(userSettings || getDefaultSettings());
-            updateConversationHistory(channelId, prompt, botResponse, userId);
+            // Create settings object with actual model used from API response
+            const actualSettings = {
+                model: response.data?.model || modelToUse,
+                temperature: apiConfig.temperature,
+                max_tokens: apiConfig.max_tokens,
+                memory: userSettings?.memory || MAX_MESSAGES
+            };
+
+            // Remove any existing parameter legend before adding the new one
+            botResponse = botResponse.replace(/\n\n\*\[LLMule params:.*?\]\*/g, '');
+            botResponse += formatParameterLegend(actualSettings);
+
+            // Update conversation history with cleaned response (without params)
+            const historyResponse = botResponse.replace(/\n\n\*\[LLMule params:.*?\]\*/g, '');
+            updateConversationHistory(channelId, prompt, historyResponse, userId);
+
             return botResponse;
         } else {
             throw new Error('Could not extract response from API');
